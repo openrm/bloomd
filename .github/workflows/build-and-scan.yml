@@ -3,7 +3,7 @@ name: Weekly image build, scan & push
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * 1' # weekly, Monday 03:00 UTC
+    - cron: '0 3 * * 4' # weekly, Thursday 03:00 UTC (after the Monday Dependabot PRs have been merged)
 
 permissions:
   actions: read # required by upload-sarif to look up the workflow run on private repos
