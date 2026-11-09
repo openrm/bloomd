@@ -24,7 +24,8 @@ RUN scons
 # RUNNER - Use Bloomd binary generated in the builder above
 ############
 
-FROM alpine:3.20 as RUNNER
+# Base pinned by digest (the tag stays for humans and for Dependabot's docker updates).
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc as RUNNER
 
 WORKDIR /etc/bloomd
 # The configuration is written at start-up, to /tmp, so the container can run as a non-root user
