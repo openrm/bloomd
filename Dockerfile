@@ -2,7 +2,7 @@
 # BUILDER - Used to build the bloomd binary
 ############
 
-FROM alpine:3.20 as BUILDER
+FROM cgr.dev/chainguard/wolfi-base:latest as BUILDER
 
 WORKDIR /etc/bloomd
 
@@ -25,8 +25,10 @@ RUN scons
 ############
 
 # Base pinned by digest (the tag stays for humans and for Dependabot's docker updates).
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc as RUNNER
+FROM cgr.dev/chainguard/busybox:latest-glibc@sha256:01c4029ff15de19e67307803fa8c4e8c913f71048c854303c80cc7bbca2323d7 as RUNNER
 
+# Chainguard images default to a non-root user; the setup steps below need root, the final USER drops it again.
+USER root
 WORKDIR /etc/bloomd
 # The configuration is written at start-up, to /tmp, so the container can run as a non-root user
 # with a read-only root filesystem (only /tmp and /data are writable then).
