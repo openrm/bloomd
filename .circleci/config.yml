@@ -1,0 +1,174 @@
+version: 2.1
+
+# Builds, scans, pushes and signs openrm/bloomd to Artifact Registry. Replaces the Docker Hub push of .github/workflows/build-and-scan.yml,
+# which keeps only the scan. Runs on every branch (build and scan, no credentials) and, on master, pushes and signs.
+#
+# The weekly rebuild (Thursday 03:00 UTC, after the Monday Dependabot base-image PRs) is a CircleCI scheduled pipeline: project
+# settings > Triggers, or the API. Scheduled pipelines are not part of this file.
+#
+# Same controls as docker-google-cloud-cli (infra-forest-catalog docs/circleci-oidc.md, fleet-ops docs/image-provenance.md):
+#   - every FROM is pinned by digest and the build refuses one that is not; Trivy and cosign run from images pinned by digest
+#   - keyless OIDC to Artifact Registry (the gcp_image_push context), no registry secrets
+#   - every pushed digest is signed and gets an SBOM and a provenance attestation (cosign keyless), then verified
+#
+# This repository is a public fork, so the settings of the CircleCI project matter as much as this file:
+#   - "Build forks" may stay on, but "Pass secrets to builds from forked pull requests" must be OFF (the default): a fork's config
+#     must never run with the gcp_image_push context. The context is only attached to the job that runs on master of this repository.
+#   - the gcp_image_push context should be restricted to the people who maintain it (context security groups), because anyone who can
+#     attach it to a job of any project of the organization can push and sign images.
+
+commands:
+  build_image:
+    description: Build the image from the Dockerfile, refusing any FROM that is not pinned by digest
+    steps:
+      - run:
+          name: Docker build
+          command: |
+            # Every FROM is pinned by digest in the Dockerfile; the last one is the base of the image. Record it as OCI labels.
+            base=$(sed -nE 's#^FROM[[:space:]]+([^[:space:]]+@sha256:[0-9a-f]{64}).*#\1#p' Dockerfile | tail -1)
+            [ -n "$base" ] || { echo "the base image in Dockerfile is not pinned by digest" >&2; exit 1; }
+            # Refuse any FROM that is not pinned, so an edit cannot quietly reintroduce a floating base.
+            if grep -E '^FROM[[:space:]]' Dockerfile | grep -vqE '@sha256:[0-9a-f]{64}'; then
+              echo "Dockerfile has a FROM that is not pinned by digest" >&2; exit 1
+            fi
+            docker build \
+              --build-arg REVISION=${CIRCLE_SHA1} \
+              --build-arg SOURCE=${CIRCLE_REPOSITORY_URL} \
+              --build-arg BASE_NAME=${base%@*} \
+              --build-arg BASE_DIGEST=${base#*@} \
+              --build-arg BUILD_URL=${CIRCLE_BUILD_URL} \
+              -t openrm/bloomd:build .
+      - run:
+          name: Trivy scan (fail on CRITICAL/HIGH)
+          command: |
+            # Run Trivy from its container image (no install step to break). The remote docker daemon can't bind-mount files from
+            # this job container, so copy .trivyignore in with docker cp. Blocks, like the GitHub workflow did.
+            docker create --name trivy \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -e TRIVY_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-db \
+              -e TRIVY_JAVA_DB_REPOSITORY=ghcr.io/aquasecurity/trivy-java-db \
+              ${TRIVY_IMAGE} \
+              image --scanners vuln --severity CRITICAL,HIGH --exit-code 1 --ignorefile /.trivyignore --ignore-unfixed openrm/bloomd:build
+            docker cp .trivyignore trivy:/.trivyignore
+            docker start -a trivy
+
+jobs:
+  # Every branch, including forks' pull requests: no context, so no credentials. Pull requests of Dependabot's base-image bumps get
+  # their build and scan here (the weekly push only happens on master).
+  build_scan:
+    docker:
+      - image: openrm/google-cloud-cli:alpine
+    environment:
+      TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+    steps:
+      - checkout
+      - setup_remote_docker
+      - build_image
+
+  push_container:
+    docker:
+      # Pulled by tag from Docker Hub (the image docker-google-cloud-cli publishes); it only runs gcloud and docker here.
+      - image: openrm/google-cloud-cli:alpine
+    environment:
+      TRIVY_IMAGE: ghcr.io/aquasecurity/trivy:0.76.1@sha256:790fd66d1697395d8693d1acaa1ea702406a20f109b6fc7bac8db623eca6c06c
+      COSIGN_IMAGE: gcr.io/projectsigstore/cosign:v3.0.2@sha256:b29487e48205d875c324c79583e2806d9d269c0fa299e0861bbec023d8430c8b
+    steps:
+      - checkout
+      - run:
+          name: Setup Google Cloud SDK
+          command: |
+            # Keyless: exchange the job's OIDC token for short-lived credentials of the CircleCI service account.
+            # The OIDC_* variables come from the gcp_image_push context (infra-forest-catalog docs/circleci-oidc.md).
+            for v in GOOGLE_PROJECT_NUMBER OIDC_WIP_ID OIDC_WIP_PROVIDER_ID OIDC_SERVICE_ACCOUNT_EMAIL CIRCLE_OIDC_TOKEN; do
+              eval "[ -n \"\${$v}\" ]" || { echo "$v is empty: the job's context needs the OIDC variables (and must be attached to the job)" >&2; exit 1; }
+            done
+            echo $CIRCLE_OIDC_TOKEN > ${HOME}/oidc-token.txt
+            gcloud iam workload-identity-pools create-cred-config \
+              projects/${GOOGLE_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${OIDC_WIP_ID}/providers/${OIDC_WIP_PROVIDER_ID} \
+              --service-account=${OIDC_SERVICE_ACCOUNT_EMAIL} \
+              --credential-source-file=${HOME}/oidc-token.txt \
+              --output-file=${HOME}/gcp_cred_config.json
+            gcloud auth login --brief --cred-file=${HOME}/gcp_cred_config.json
+            echo "export GOOGLE_APPLICATION_CREDENTIALS=${HOME}/gcp_cred_config.json" >> $BASH_ENV
+            gcloud --quiet config set project ${GOOGLE_PROJECT_ID}
+      - setup_remote_docker
+      - build_image
+      - run:
+          name: Docker push
+          command: |
+            [ -n "$CONTAINER_MIRRORS" ] || { echo "CONTAINER_MIRRORS is empty: the job needs the gcp_image_push context" >&2; exit 1; }
+            # <sha>-<build number> is unique per build: a weekly rebuild of the same commit (a newer base) gets a new tag, so it can
+            # be told apart and deployed. The catalog deploys by digest (tags.json), not by `latest`.
+            tags="${CIRCLE_SHA1}-${CIRCLE_BUILD_NUM} ${CIRCLE_SHA1} latest"
+            for location in $CONTAINER_MIRRORS; do
+              server=${location}-docker.pkg.dev
+              repository=${server}/${CONTAINER_PROJECT}/${CONTAINER_REPOSITORY}
+              for tag in $tags; do
+                docker tag openrm/bloomd:build $repository/openrm/bloomd:$tag
+              done
+              gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://$server
+              for tag in $tags; do
+                docker push $repository/openrm/bloomd:$tag | tee push.log
+              done
+              # The manifest digest is the same for every tag and mirror; keep one per mirror for the sign step.
+              digest=$(sed -nE 's/.*digest: (sha256:[0-9a-f]{64}).*/\1/p' push.log | tail -1)
+              [ -n "$digest" ] || { echo "could not read the pushed digest" >&2; exit 1; }
+              echo "$repository/openrm/bloomd@$digest" | tee -a pushed-digests.txt
+            done
+      - run:
+          name: Sign and attest the pushed images (SBOM + provenance), then verify
+          command: |
+            # Keyless: the image-push account mints an OpenID token for Fulcio (fleet-ops docs/image-provenance.md). Straight from the
+            # IAM Credentials API: gcloud's --impersonate-service-account would also need getAccessToken (TokenCreator), while this
+            # call needs only getOpenIdToken, which the account has on itself.
+            token=$(curl -sf -X POST \
+              -H "Authorization: Bearer $(gcloud auth print-access-token)" -H "Content-Type: application/json" \
+              -d '{"audience": "sigstore", "includeEmail": true}' \
+              "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${OIDC_SERVICE_ACCOUNT_EMAIL}:generateIdToken" \
+              | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+            [ -n "$token" ] || { echo "could not get an OpenID token for ${OIDC_SERVICE_ACCOUNT_EMAIL}" >&2; exit 1; }
+            # SBOM of exactly what was built (Trivy, CycloneDX); remote docker, so docker cp in/out.
+            docker create --name sbom -v /var/run/docker.sock:/var/run/docker.sock ${TRIVY_IMAGE} \
+              image --format cyclonedx --output /sbom.cdx.json --scanners vuln openrm/bloomd:build
+            docker start -a sbom && docker cp sbom:/sbom.cdx.json sbom.cdx.json
+            base=$(sed -nE 's#^FROM[[:space:]]+([^[:space:]]+@sha256:[0-9a-f]{64}).*#\1#p' Dockerfile | tail -1)
+            # printf, not a heredoc: CircleCI config v2.1 reads a double less-than sign as a parameter tag
+            printf '{"repo": "%s", "commit": "%s", "base": "%s", "build_url": "%s", "workflow_id": "%s"}\n' \
+              "${CIRCLE_REPOSITORY_URL}" "${CIRCLE_SHA1}" "${base}" "${CIRCLE_BUILD_URL}" "${CIRCLE_WORKFLOW_ID}" > provenance.json
+            # The cosign image is distroless (no shell): one container per command, files copied in with docker cp
+            # (the remote docker daemon can't bind-mount from this job). chmod so any container user can read them.
+            mkdir -p dockercfg && cp ${HOME}/.docker/config.json dockercfg/config.json
+            chmod -R a+rX dockercfg && chmod a+r sbom.cdx.json provenance.json
+            cosign() {
+              docker rm -f cosign >/dev/null 2>&1 || true
+              docker create --name cosign -e COSIGN_YES=true -e DOCKER_CONFIG=/dockercfg ${COSIGN_IMAGE} "$@" >/dev/null
+              docker cp sbom.cdx.json cosign:/sbom.cdx.json
+              docker cp provenance.json cosign:/provenance.json
+              docker cp dockercfg cosign:/dockercfg
+              docker start -a cosign
+            }
+            for ref in $(cat pushed-digests.txt); do
+              cosign sign --identity-token "$token" $ref
+              cosign attest --identity-token "$token" --type cyclonedx --predicate /sbom.cdx.json $ref
+              cosign attest --identity-token "$token" --type custom --predicate /provenance.json $ref
+            done
+            # The check a consumer or admission policy makes: this pipeline's service account, via Google's issuer.
+            for ref in $(cat pushed-digests.txt); do
+              cosign verify --certificate-identity "${OIDC_SERVICE_ACCOUNT_EMAIL}" --certificate-oidc-issuer https://accounts.google.com $ref >/dev/null
+              cosign verify-attestation --type cyclonedx --certificate-identity "${OIDC_SERVICE_ACCOUNT_EMAIL}" --certificate-oidc-issuer https://accounts.google.com $ref >/dev/null
+              cosign verify-attestation --type custom --certificate-identity "${OIDC_SERVICE_ACCOUNT_EMAIL}" --certificate-oidc-issuer https://accounts.google.com $ref >/dev/null
+            done
+
+workflows:
+  version: 2
+  workflow:
+    jobs:
+      - build_scan:
+          filters:
+            branches:
+              ignore: master
+      - push_container:
+          context: gcp_image_push
+          filters:
+            branches:
+              only: master
