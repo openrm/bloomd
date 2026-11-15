@@ -2,7 +2,8 @@
 # BUILDER - Used to build the bloomd binary
 ############
 
-FROM cgr.dev/chainguard/wolfi-base:latest as BUILDER
+# Pinned by digest like the runner base (the tag stays for humans and for Dependabot's docker updates); CI refuses an unpinned FROM.
+FROM cgr.dev/chainguard/wolfi-base:latest@sha256:833c48f1faf32c90e6f9501a2410a9aa28ceb2c594102edd4470053c30efa089 as BUILDER
 
 WORKDIR /etc/bloomd
 
@@ -54,3 +55,15 @@ RUN chown 1000:1000 /data
 USER 1000:1000
 
 CMD ["./entry.sh"]
+
+# What the build records about itself (set by CI, see .circleci/config.yml): the commit, the base and the build.
+ARG REVISION=unknown
+ARG SOURCE=unknown
+ARG BASE_NAME=unknown
+ARG BASE_DIGEST=unknown
+ARG BUILD_URL=unknown
+LABEL org.opencontainers.image.revision=$REVISION \
+      org.opencontainers.image.source=$SOURCE \
+      org.opencontainers.image.base.name=$BASE_NAME \
+      org.opencontainers.image.base.digest=$BASE_DIGEST \
+      co.openrm.build-url=$BUILD_URL
