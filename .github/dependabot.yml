@@ -1,8 +1,7 @@
 version: 2
 updates:
   # Base image digests: the final stage is pinned as <image>:<tag>@sha256:<digest>, so an upstream patch (new packages
-  # in the same tag) arrives as a PR that CI builds and Trivy-scans; fleet-ops merges it (scripts/dependabot_merge.py)
-  # and deploy_tags.py pins the result.
+  # in the same tag) arrives as a PR that CI builds and Trivy-scans; once merged, CI pushes and signs a new image.
   - package-ecosystem: docker
     directory: /
     schedule:

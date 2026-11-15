@@ -3,10 +3,9 @@ version: 2.1
 # Builds, scans, pushes and signs openrm/bloomd to Artifact Registry. Replaces the Docker Hub push of .github/workflows/build-and-scan.yml,
 # which keeps only the scan. Runs on every branch (build and scan, no credentials) and, on master, pushes and signs.
 #
-# The weekly rebuild (Thursday 03:00 UTC, after the Monday Dependabot base-image PRs) is a CircleCI scheduled pipeline: project
-# settings > Triggers, or the API. Scheduled pipelines are not part of this file.
+# There is no schedule: the image is rebuilt when a merge to master changes it, and that includes Dependabot's daily base-image PRs.
 #
-# Same controls as docker-google-cloud-cli (infra-forest-catalog docs/circleci-oidc.md, fleet-ops docs/image-provenance.md):
+# Same controls as the other images this organization builds:
 #   - every FROM is pinned by digest and the build refuses one that is not; Trivy and cosign run from images pinned by digest
 #   - keyless OIDC to Artifact Registry (the gcp_image_push context), no registry secrets
 #   - every pushed digest is signed and gets an SBOM and a provenance attestation (cosign keyless), then verified
@@ -54,7 +53,7 @@ commands:
 
 jobs:
   # Every branch, including forks' pull requests: no context, so no credentials. Pull requests of Dependabot's base-image bumps get
-  # their build and scan here (the weekly push only happens on master).
+  # their build and scan here (the push only happens on master).
   build_scan:
     docker:
       - image: openrm/google-cloud-cli:alpine
@@ -78,7 +77,7 @@ jobs:
           name: Setup Google Cloud SDK
           command: |
             # Keyless: exchange the job's OIDC token for short-lived credentials of the CircleCI service account.
-            # The OIDC_* variables come from the gcp_image_push context (infra-forest-catalog docs/circleci-oidc.md).
+            # The OIDC_* variables come from the gcp_image_push context.
             for v in GOOGLE_PROJECT_NUMBER OIDC_WIP_ID OIDC_WIP_PROVIDER_ID OIDC_SERVICE_ACCOUNT_EMAIL CIRCLE_OIDC_TOKEN; do
               eval "[ -n \"\${$v}\" ]" || { echo "$v is empty: the job's context needs the OIDC variables (and must be attached to the job)" >&2; exit 1; }
             done
@@ -97,7 +96,7 @@ jobs:
           name: Docker push
           command: |
             [ -n "$CONTAINER_MIRRORS" ] || { echo "CONTAINER_MIRRORS is empty: the job needs the gcp_image_push context" >&2; exit 1; }
-            # <sha>-<build number> is unique per build: a weekly rebuild of the same commit (a newer base) gets a new tag, so it can
+            # <sha>-<build number> is unique per build: a rebuild of the same commit (a newer base) gets a new tag, so it can
             # be told apart and deployed. The catalog deploys by digest (tags.json), not by `latest`.
             tags="${CIRCLE_SHA1}-${CIRCLE_BUILD_NUM} ${CIRCLE_SHA1} latest"
             for location in $CONTAINER_MIRRORS; do
@@ -118,7 +117,7 @@ jobs:
       - run:
           name: Sign and attest the pushed images (SBOM + provenance), then verify
           command: |
-            # Keyless: the image-push account mints an OpenID token for Fulcio (fleet-ops docs/image-provenance.md). Straight from the
+            # Keyless: the image-push account mints an OpenID token for Fulcio. Straight from the
             # IAM Credentials API: gcloud's --impersonate-service-account would also need getAccessToken (TokenCreator), while this
             # call needs only getOpenIdToken, which the account has on itself.
             token=$(curl -sf -X POST \
